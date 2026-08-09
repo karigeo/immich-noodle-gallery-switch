@@ -1,0 +1,411 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+#
+# lib/flavor.func — flavor bookkeeping, preflight, backups and service control for
+# a community-scripts Immich LXC that can run either Immich or Noodle Gallery.
+#
+# Copyright (c) 2026 — MIT
+#
+# Requires misc/core.func and misc/tools.func, and lib/build.func (for flavor_paths).
+
+# Consumed by the entrypoints that source this file.
+# shellcheck disable=SC2034
+GALLERY_REPO="open-noodle/gallery"
+# shellcheck disable=SC2034
+IMMICH_REPO="immich-app/immich"
+
+# ==============================================================================
+# Preflight
+# ==============================================================================
+
+flavor_require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    msg_error "This must run as root inside the Immich LXC."
+    exit 1
+  fi
+}
+
+# Refuse to run on the Proxmox host — everything here manipulates /opt/immich.
+flavor_require_container() {
+  if command -v pveversion >/dev/null 2>&1; then
+    msg_error "This runs *inside* the Immich LXC, not on the Proxmox host."
+    msg_error "Enter the container first:  pct enter <ctid>"
+    exit 1
+  fi
+}
+
+flavor_require_install() {
+  flavor_paths
+  local unit
+  if [[ ! -d "$INSTALL_DIR" ]]; then
+    msg_error "No Immich installation found at ${INSTALL_DIR}."
+    exit 1
+  fi
+  for unit in immich-web.service immich-ml.service; do
+    if [[ ! -f "/etc/systemd/system/${unit}" ]]; then
+      msg_error "Missing /etc/systemd/system/${unit} — this does not look like a community-scripts Immich LXC."
+      exit 1
+    fi
+  done
+  if [[ ! -f "${INSTALL_DIR}/.env" ]]; then
+    msg_error "Missing ${INSTALL_DIR}/.env — cannot determine database or media location."
+    exit 1
+  fi
+}
+
+# Free space in GiB on the filesystem holding $1.
+flavor_free_gb() {
+  df -BG --output=avail "$1" 2>/dev/null | tail -1 | tr -dc '0-9'
+}
+
+flavor_require_space() {
+  local need_gb="$1" have_gb
+  have_gb="$(flavor_free_gb "$INSTALL_DIR")"
+  if [[ -z "$have_gb" ]]; then
+    msg_warn "Could not determine free space on ${INSTALL_DIR}; continuing."
+    return 0
+  fi
+  if ((have_gb < need_gb)); then
+    msg_error "Only ${have_gb}GB free on ${INSTALL_DIR}; the build needs about ${need_gb}GB."
+    msg_error "Grow the container disk (pct resize <ctid> rootfs +10G) and retry."
+    exit 1
+  fi
+  msg_ok "Disk space OK (${have_gb}GB free)"
+}
+
+# ==============================================================================
+# Flavor marker
+# ==============================================================================
+#
+# /opt/immich/.flavor is absent on a stock community-scripts Immich install, so
+# "no file" means "immich".
+#
+#   FLAVOR=gallery
+#   VERSION=5.3.1
+#   UPSTREAM_IMMICH=3.1.0
+#   SWITCHED_AT=2026-08-09T12:00:00+02:00
+#   BACKUP_DIR=/opt/immich/backups/pre-gallery-20260809-120000
+
+flavor_detect() {
+  flavor_paths
+  FLAVOR_CURRENT="immich"
+  FLAVOR_VERSION=""
+  FLAVOR_UPSTREAM=""
+  FLAVOR_BACKUP_DIR=""
+
+  if [[ -f "$FLAVOR_FILE" ]]; then
+    local FLAVOR="" VERSION="" UPSTREAM_IMMICH="" BACKUP_DIR=""
+    # shellcheck disable=SC1090
+    source "$FLAVOR_FILE"
+    FLAVOR_CURRENT="${FLAVOR:-immich}"
+    FLAVOR_VERSION="${VERSION:-}"
+    FLAVOR_UPSTREAM="${UPSTREAM_IMMICH:-}"
+    FLAVOR_BACKUP_DIR="${BACKUP_DIR:-}"
+  fi
+
+  if [[ "$FLAVOR_CURRENT" == "immich" && -z "$FLAVOR_VERSION" ]]; then
+    FLAVOR_VERSION="$(cat "${HOME}/.immich" 2>/dev/null || echo "unknown")"
+  fi
+  export FLAVOR_CURRENT FLAVOR_VERSION FLAVOR_UPSTREAM FLAVOR_BACKUP_DIR
+}
+
+flavor_write_marker() {
+  local flavor="$1" version="$2" upstream="$3" backup_dir="${4:-}"
+  flavor_paths
+  mkdir -p "$FLAVOR_STATE_DIR"
+  cat <<EOF >"$FLAVOR_FILE"
+# Written by immich-flavor. Tells ct/gallery.sh which flavor is installed.
+FLAVOR=${flavor}
+VERSION=${version}
+UPSTREAM_IMMICH=${upstream}
+SWITCHED_AT=$(date --iso-8601=seconds)
+BACKUP_DIR=${backup_dir}
+EOF
+}
+
+# Rewrites just the VERSION= line, for the updater.
+flavor_bump_marker_version() {
+  local version="$1"
+  flavor_paths
+  [[ -f "$FLAVOR_FILE" ]] || return 0
+  sed -i "s/^VERSION=.*/VERSION=${version}/" "$FLAVOR_FILE"
+}
+
+flavor_clear_marker() {
+  flavor_paths
+  rm -f "$FLAVOR_FILE"
+}
+
+# ==============================================================================
+# Database helpers
+# ==============================================================================
+
+flavor_db_name() {
+  flavor_paths
+  local name
+  name="$(sed -n '/^DB_DATABASE_NAME/s/[^=]*=//p' "${INSTALL_DIR}/.env" | tr -d '[:space:]')"
+  echo "${name:-immich}"
+}
+
+# flavor_pg_dump <target-file>
+#
+# Custom-format dump (restorable with pg_restore --clean --if-exists). Fails hard
+# on an empty result — a zero-byte "backup" is worse than none.
+flavor_pg_dump() {
+  local target="$1" db
+  db="$(flavor_db_name)"
+
+  msg_info "Dumping database '${db}' to ${target}"
+  install -d -m 0755 "$(dirname "$target")"
+  # postgres needs to be able to write the file
+  install -o postgres -g postgres -m 0600 /dev/null "$target"
+  if ! $STD sudo -u postgres pg_dump -Fc -d "$db" -f "$target"; then
+    msg_error "pg_dump failed — refusing to continue without a database backup."
+    return 1
+  fi
+  if [[ ! -s "$target" ]]; then
+    msg_error "pg_dump produced an empty file — refusing to continue."
+    return 1
+  fi
+  msg_ok "Database dumped ($(du -h "$target" | cut -f1))"
+}
+
+# flavor_pg_restore <dump-file>
+#
+# Staged into /tmp under postgres ownership first, so a dump sitting anywhere the
+# postgres user cannot read still restores.
+flavor_pg_restore() {
+  local dump="$1" db staged
+  db="$(flavor_db_name)"
+
+  if [[ ! -s "$dump" ]]; then
+    msg_error "Dump file ${dump} is missing or empty."
+    return 1
+  fi
+
+  staged="/tmp/immich-flavor-restore.$$.dump"
+  install -o postgres -g postgres -m 0600 "$dump" "$staged"
+
+  msg_info "Restoring database '${db}' from ${dump}"
+  if ! $STD sudo -u postgres pg_restore --clean --if-exists --no-owner -d "$db" "$staged"; then
+    rm -f "$staged"
+    msg_error "pg_restore reported errors. Inspect the database before starting the server."
+    return 1
+  fi
+  rm -f "$staged"
+  msg_ok "Database restored"
+}
+
+# ==============================================================================
+# Backups
+# ==============================================================================
+
+# flavor_backup <label>  ->  sets FLAVOR_BACKUP_PATH
+#
+# Captures the database plus everything the installer generated that is not
+# reproducible from source: .env, both systemd units, and the version markers.
+# The result goes into a global rather than stdout because the msg_* helpers write
+# to stdout too, so a command substitution here would capture the spinner output.
+flavor_backup() {
+  local label="$1" dir
+  flavor_paths
+  dir="${BACKUP_ROOT}/${label}-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$dir"
+
+  flavor_pg_dump "${dir}/database.dump" || return 1
+
+  cp "${INSTALL_DIR}/.env" "${dir}/env" 2>/dev/null || true
+  cp /etc/systemd/system/immich-web.service "${dir}/" 2>/dev/null || true
+  cp /etc/systemd/system/immich-ml.service "${dir}/" 2>/dev/null || true
+  cp "${HOME}/.immich" "${dir}/version.immich" 2>/dev/null || true
+  cp "${HOME}/.gallery" "${dir}/version.gallery" 2>/dev/null || true
+  cp "${HOME}/.immich_library_revisions" "${dir}/" 2>/dev/null || true
+  cp /usr/bin/update "${dir}/update.shim" 2>/dev/null || true
+
+  FLAVOR_BACKUP_PATH="$dir"
+  export FLAVOR_BACKUP_PATH
+  msg_ok "Backup written to ${dir}"
+}
+
+# flavor_snapshot_app <backup-dir>
+#
+# Moves app/ aside instead of deleting it — same filesystem, so it is instant and
+# gives a fast local rollback. Only when there is room to hold two copies.
+flavor_snapshot_app() {
+  local dir="$1" app_gb free_gb
+  flavor_paths
+  [[ -d "$APP_DIR" ]] || return 1
+
+  app_gb="$(du -sBG "$APP_DIR" 2>/dev/null | cut -f1 | tr -dc '0-9')"
+  free_gb="$(flavor_free_gb "$INSTALL_DIR")"
+  if [[ -z "$app_gb" || -z "$free_gb" ]] || ((free_gb < app_gb + 10)); then
+    msg_warn "Not enough room to keep a copy of app/ (${app_gb:-?}GB used, ${free_gb:-?}GB free) — skipping app snapshot"
+    return 1
+  fi
+
+  msg_info "Snapshotting current app/ to ${dir}/app"
+  mv "$APP_DIR" "${dir}/app"
+  mkdir -p "$APP_DIR"
+  msg_ok "Snapshotted app/ (delete ${dir}/app once you are happy)"
+}
+
+# flavor_restore_app_snapshot <backup-dir>
+#
+# Puts a snapshotted app/ back. Used when a build fails: the database has not been
+# touched at that point, so restoring app/ returns the container to a working state.
+flavor_restore_app_snapshot() {
+  local dir="$1"
+  flavor_paths
+  if [[ ! -d "${dir}/app" ]]; then
+    msg_error "No app snapshot at ${dir}/app to restore."
+    return 1
+  fi
+  msg_info "Restoring app/ from ${dir}/app"
+  rm -rf "${APP_DIR:?}"
+  mv "${dir}/app" "$APP_DIR"
+  msg_ok "Restored app/"
+}
+
+# ==============================================================================
+# Services
+# ==============================================================================
+
+flavor_maintenance() {
+  local action="$1" verb # enable | disable
+  flavor_paths
+  [[ -x "${APP_DIR}/bin/immich-admin" ]] || return 0
+  [[ "$action" == "enable" ]] && verb="Enabling" || verb="Disabling"
+
+  msg_info "${verb} maintenance mode"
+  if (cd "${APP_DIR}/bin" && $STD ./immich-admin "${action}-maintenance-mode"); then
+    msg_ok "${verb%ing}ed maintenance mode"
+  else
+    msg_warn "Could not ${action} maintenance mode (continuing)"
+  fi
+  return 0
+}
+
+flavor_stop_services() {
+  msg_info "Stopping services"
+  systemctl stop immich-web 2>/dev/null || true
+  systemctl stop immich-ml 2>/dev/null || true
+  msg_ok "Stopped services"
+}
+
+flavor_start_services() {
+  msg_info "Starting services"
+  systemctl start immich-ml
+  systemctl start immich-web
+  msg_ok "Started services"
+}
+
+# ==============================================================================
+# /usr/bin/update shim and MOTD
+# ==============================================================================
+#
+# install.func's customize() writes /usr/bin/update as a one-liner that curls
+# ct/<app>.sh. After switching to Gallery that must point at this repo's
+# ct/gallery.sh instead, or `update` would rebuild Immich over Gallery's schema.
+
+flavor_set_update_shim() {
+  local url="$1"
+  flavor_paths
+  mkdir -p "$FLAVOR_STATE_DIR"
+
+  if [[ -f /usr/bin/update && ! -f "${FLAVOR_STATE_DIR}/update.immich" ]]; then
+    cp /usr/bin/update "${FLAVOR_STATE_DIR}/update.immich"
+  fi
+
+  cat <<EOF >/usr/bin/update
+set -a; [ -f /etc/profile.d/90-http-proxy.sh ] && . /etc/profile.d/90-http-proxy.sh; set +a; bash -c "\$(curl -fsSL ${url})"
+EOF
+  chmod +x /usr/bin/update
+  msg_ok "Repointed /usr/bin/update at ${url}"
+}
+
+flavor_restore_update_shim() {
+  flavor_paths
+  if [[ -f "${FLAVOR_STATE_DIR}/update.immich" ]]; then
+    cp "${FLAVOR_STATE_DIR}/update.immich" /usr/bin/update
+    rm -f "${FLAVOR_STATE_DIR}/update.immich"
+  else
+    cat <<'EOF' >/usr/bin/update
+set -a; [ -f /etc/profile.d/90-http-proxy.sh ] && . /etc/profile.d/90-http-proxy.sh; set +a; bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/immich.sh)"
+EOF
+  fi
+  chmod +x /usr/bin/update
+  msg_ok "Restored /usr/bin/update to the community-scripts Immich updater"
+}
+
+# flavor_set_motd_name <from> <to>
+#
+# motd_ssh() writes "<APPLICATION> LXC Container" into the login banner. Swap just
+# that phrase so the banner does not keep claiming Immich after a switch.
+flavor_set_motd_name() {
+  local from="$1" to="$2" profile="/etc/profile.d/00_lxc-details.sh"
+  [[ -f "$profile" ]] || return 0
+  sed -i "s|${from} LXC Container|${to} LXC Container|g" "$profile" 2>/dev/null || true
+  return 0
+}
+
+# ==============================================================================
+# Version discovery
+# ==============================================================================
+
+# The Immich release a given Gallery tag is rebased onto, straight from the fork's
+# branding/config.json. Gallery is a rebase fork, so this is the version its
+# migrations expect to find in the database.
+flavor_gallery_upstream_version() {
+  local tag="$1" url json
+  url="https://raw.githubusercontent.com/${GALLERY_REPO}/${tag}/branding/config.json"
+  json="$(curl -fsSL --max-time 20 "$url" 2>/dev/null)" || return 1
+  echo "$json" | jq -r '.upstream.version // empty'
+}
+
+# Same lookup against the source tree already on disk.
+flavor_installed_gallery_upstream_version() {
+  flavor_paths
+  local cfg="${SRC_DIR}/branding/config.json"
+  [[ -f "$cfg" ]] || return 1
+  jq -r '.upstream.version // empty' "$cfg"
+}
+
+flavor_strip_v() {
+  local v="$1"
+  [[ "$v" =~ ^v[0-9] ]] && v="${v:1}"
+  echo "$v"
+}
+
+# ==============================================================================
+# Interaction
+# ==============================================================================
+
+# flavor_confirm [expected-word]  <<EOF
+# ...prompt text on stdin...
+# EOF
+#
+# The prompt arrives on stdin rather than as an argument so callers can use a
+# plain heredoc; nesting one inside "$( )" is not portable. The answer is read
+# from the controlling terminal, so this still works under `bash -c "$(curl …)"`.
+# ASSUME_YES=1 skips the prompt.
+flavor_confirm() {
+  local expected="${1:-yes}" prompt answer=""
+  prompt="$(cat)"
+
+  if [[ "${ASSUME_YES:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ ! -r /dev/tty ]]; then
+    msg_error "No terminal available to confirm. Re-run with --yes if you are sure."
+    return 1
+  fi
+
+  echo ""
+  echo -e "${prompt}"
+  read -r -p "Type '${expected}' to continue: " answer </dev/tty
+  if [[ "$answer" != "$expected" ]]; then
+    msg_error "Aborted."
+    return 1
+  fi
+  return 0
+}
