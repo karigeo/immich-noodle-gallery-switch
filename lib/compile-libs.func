@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# shellcheck shell=bash
+# Kept byte-comparable with upstream, so the bare `cd`s it uses are left as they
+# are (catch_errors' `set -e` aborts on a failed cd anyway).
+# shellcheck disable=SC2164
+#
+# lib/compile-libs.func — custom image-processing library recompiles.
+#
+# VERBATIM COPY of the compile_* functions from community-scripts/ProxmoxVE
+# SYNCED-FROM: ct/immich.sh @ 33de14e45cbae374f3ae33386824e4bde0a5e8ce (2026-08-07)
+# License: MIT | https://github.com/community-scripts/ProxmoxVE/raw/main/LICENSE
+#
+# These are flavor-agnostic: libjxl, libheif, libraw, ImageMagick and libvips are
+# system libraries under /usr/local/lib, shared by Immich and Noodle Gallery alike,
+# and the pinned revisions come from immich-app/base-images, which Gallery does not
+# fork. Run tools/check-upstream-drift.sh before bumping a release to see whether
+# upstream changed any of this.
+#
+# Requires misc/core.func and misc/tools.func.
+
+# ------------------------------------------------------------------------------
+# flavor_recompile_libraries()
+#
+# Only does anything on installs that have ~/.immich_library_revisions, i.e. those
+# built by install/immich-install.sh. Each compile_* is a no-op when the pinned
+# revision already matches what is recorded there.
+# ------------------------------------------------------------------------------
+flavor_recompile_libraries() {
+  [[ -f ~/.immich_library_revisions ]] || return 0
+
+  STAGING_DIR=/opt/staging
+  BASE_DIR=${STAGING_DIR}/base-images
+  SOURCE_DIR=${STAGING_DIR}/image-source
+  export STAGING_DIR BASE_DIR SOURCE_DIR
+  export LD_RUN_PATH=/usr/local/lib
+
+  if [[ ! -d "$BASE_DIR" ]]; then
+    msg_warn "${BASE_DIR} is missing — skipping image-library update check"
+    return 0
+  fi
+
+  local libraries=("libjxl" "libheif" "libraw" "imagemagick" "libvips") library
+  cd "$BASE_DIR"
+  msg_warn "Checking for updates to custom image-processing libraries (recompile time: 2-15min per library)"
+  $STD git pull
+  for library in "${libraries[@]}"; do
+    compile_"$library"
+  done
+  msg_ok "Image-processing libraries up to date"
+}
+
+function compile_libjxl() {
+  SOURCE=${SOURCE_DIR}/libjxl
+  JPEGLI_LIBJPEG_LIBRARY_SOVERSION="62"
+  JPEGLI_LIBJPEG_LIBRARY_VERSION="62.3.0"
+  LIBJXL_REVISION="332feb17d17311c748445f7ee75c4fb55cc38530"
+  if [[ "$LIBJXL_REVISION" != "$(grep 'libjxl' ~/.immich_library_revisions | awk '{print $2}')" ]]; then
+    msg_info "Recompiling libjxl"
+    [[ -d "$SOURCE" ]] && rm -rf "$SOURCE"
+    $STD git clone https://github.com/libjxl/libjxl.git "$SOURCE"
+    cd "$SOURCE"
+    $STD git reset --hard "$LIBJXL_REVISION"
+    $STD git submodule update --init --recursive --depth 1 --recommend-shallow
+    $STD git apply "$BASE_DIR"/server/sources/libjxl-patches/jpegli-empty-dht-marker.patch
+    $STD git apply "$BASE_DIR"/server/sources/libjxl-patches/jpegli-icc-warning.patch
+    mkdir build
+    cd build
+    $STD cmake \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TESTING=OFF \
+      -DJPEGXL_ENABLE_DOXYGEN=OFF \
+      -DJPEGXL_ENABLE_MANPAGES=OFF \
+      -DJPEGXL_ENABLE_PLUGIN_GIMP210=OFF \
+      -DJPEGXL_ENABLE_BENCHMARK=OFF \
+      -DJPEGXL_ENABLE_EXAMPLES=OFF \
+      -DJPEGXL_FORCE_SYSTEM_BROTLI=ON \
+      -DJPEGXL_FORCE_SYSTEM_HWY=ON \
+      -DJPEGXL_ENABLE_JPEGLI=ON \
+      -DJPEGXL_ENABLE_JPEGLI_LIBJPEG=ON \
+      -DJPEGXL_INSTALL_JPEGLI_LIBJPEG=ON \
+      -DJPEGXL_ENABLE_PLUGINS=ON \
+      -DJPEGLI_LIBJPEG_LIBRARY_SOVERSION="$JPEGLI_LIBJPEG_LIBRARY_SOVERSION" \
+      -DJPEGLI_LIBJPEG_LIBRARY_VERSION="$JPEGLI_LIBJPEG_LIBRARY_VERSION" \
+      -DLIBJPEG_TURBO_VERSION_NUMBER=2001005 \
+      ..
+    $STD cmake --build . -- -j"$(nproc)"
+    $STD cmake --install .
+    ldconfig /usr/local/lib
+    $STD make clean
+    cd "$STAGING_DIR"
+    rm -rf "$SOURCE"/{build,third_party}
+    sed -i "s/libjxl: .*$/libjxl: $LIBJXL_REVISION/" ~/.immich_library_revisions
+    msg_ok "Recompiled libjxl"
+  fi
+}
+
+function compile_libheif() {
+  SOURCE=${SOURCE_DIR}/libheif
+  ensure_dependencies libaom-dev
+  LIBHEIF_REVISION="62f1b8c76ed4d8305071fdacbe74ef9717bacac5"
+  if [[ "${update:-}" ]] || [[ "$LIBHEIF_REVISION" != "$(grep 'libheif' ~/.immich_library_revisions | awk '{print $2}')" ]]; then
+    msg_info "Recompiling libheif"
+    [[ -d "$SOURCE" ]] && rm -rf "$SOURCE"
+    $STD git clone https://github.com/strukturag/libheif.git "$SOURCE"
+    cd "$SOURCE"
+    $STD git reset --hard "$LIBHEIF_REVISION"
+    mkdir build
+    cd build
+    $STD cmake --preset=release-noplugins \
+      -DWITH_DAV1D=ON \
+      -DENABLE_PARALLEL_TILE_DECODING=ON \
+      -DWITH_LIBSHARPYUV=ON \
+      -DWITH_LIBDE265=ON \
+      -DWITH_AOM_DECODER=OFF \
+      -DWITH_AOM_ENCODER=ON \
+      -DWITH_X265=OFF \
+      -DWITH_EXAMPLES=OFF \
+      ..
+    $STD make install -j"$(nproc)"
+    ldconfig /usr/local/lib
+    $STD make clean
+    cd "$STAGING_DIR"
+    rm -rf "$SOURCE"/build
+    sed -i "s/libheif: .*$/libheif: $LIBHEIF_REVISION/" ~/.immich_library_revisions
+    msg_ok "Recompiled libheif"
+  fi
+}
+
+function compile_libraw() {
+  SOURCE=${SOURCE_DIR}/libraw
+  LIBRAW_REVISION="b860248a89d9082b8e0a1e202e516f46af9adb29"
+  if [[ "$LIBRAW_REVISION" != "$(grep 'libraw' ~/.immich_library_revisions | awk '{print $2}')" ]]; then
+    msg_info "Recompiling libraw"
+    [[ -d "$SOURCE" ]] && rm -rf "$SOURCE"
+    $STD git clone https://github.com/LibRaw/LibRaw.git "$SOURCE"
+    cd "$SOURCE"
+    $STD git reset --hard "$LIBRAW_REVISION"
+    $STD autoreconf --install
+    $STD ./configure --disable-examples
+    $STD make -j"$(nproc)"
+    $STD make install
+    ldconfig /usr/local/lib
+    $STD make clean
+    cd "$STAGING_DIR"
+    sed -i "s/libraw: .*$/libraw: $LIBRAW_REVISION/" ~/.immich_library_revisions
+    msg_ok "Recompiled libraw"
+  fi
+}
+
+function compile_imagemagick() {
+  SOURCE=$SOURCE_DIR/imagemagick
+  : "${IMAGEMAGICK_REVISION:=$(jq -cr '.revision' "$BASE_DIR"/server/sources/imagemagick.json)}"
+  if [[ "$IMAGEMAGICK_REVISION" != "$(grep 'imagemagick' ~/.immich_library_revisions | awk '{print $2}')" ]] ||
+    ! grep -q 'DMAGICK_LIBRAW' /usr/local/lib/ImageMagick-7*/config-Q16HDRI/configure.xml; then
+    msg_info "Recompiling ImageMagick"
+    [[ -d "$SOURCE" ]] && rm -rf "$SOURCE"
+    $STD git clone https://github.com/ImageMagick/ImageMagick.git "$SOURCE"
+    cd "$SOURCE"
+    $STD git reset --hard "$IMAGEMAGICK_REVISION"
+    $STD ./configure --with-modules CPPFLAGS="-DMAGICK_LIBRAW_VERSION_TAIL=202502"
+    $STD make -j"$(nproc)"
+    $STD make install
+    ldconfig /usr/local/lib
+    $STD make clean
+    cd "$STAGING_DIR"
+    sed -i "s/imagemagick: .*$/imagemagick: $IMAGEMAGICK_REVISION/" ~/.immich_library_revisions
+    msg_ok "Recompiled ImageMagick"
+  fi
+}
+
+function compile_libvips() {
+  SOURCE=$SOURCE_DIR/libvips
+  LIBVIPS_REVISION="e01a4797cabe77d457fdfa7d776b7a7e7ca6d6a7"
+  if [[ "$LIBVIPS_REVISION" != "$(grep 'libvips' ~/.immich_library_revisions | awk '{print $2}')" ]]; then
+    msg_info "Recompiling libvips"
+    [[ -d "$SOURCE" ]] && rm -rf "$SOURCE"
+    $STD git clone https://github.com/libvips/libvips.git "$SOURCE"
+    cd "$SOURCE"
+    $STD git reset --hard "$LIBVIPS_REVISION"
+    $STD git apply "$BASE_DIR"/server/sources/libvips-patches/0001-put-other-loaders-ahead-of-dcrawload.patch
+    $STD meson setup build --buildtype=release --libdir=lib -Dintrospection=disabled -Dtiff=disabled
+    cd build
+    $STD ninja install
+    ldconfig /usr/local/lib
+    cd "$STAGING_DIR"
+    rm -rf "$SOURCE"/build
+    sed -i "s/libvips: .*$/libvips: $LIBVIPS_REVISION/" ~/.immich_library_revisions
+    msg_ok "Recompiled libvips"
+  fi
+}
