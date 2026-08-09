@@ -182,6 +182,31 @@ tools/check-upstream-drift.sh            # show what changed upstream
 tools/check-upstream-drift.sh --update   # accept the snapshots once ported
 ```
 
+## Expected oddities after a switch
+
+**The admin UI reports version 3.1.0 and offers an update to v5.3.1, forever.**
+Not a failed switch — it is how Gallery is put together, and it happens on their
+Docker deployment too:
+
+- the server reports `server/package.json`'s `version`, and Gallery keeps that
+  pinned to the Immich release it is rebased on (`3.1.0` at tag v5.3.1) rather
+  than to its own tag;
+- the update check polls `https://version.opennoodle.de/gallery`
+  (`server/src/repositories/config.repository.ts`), which returns `v5.3.1`;
+- `3.1.0 < 5.3.1`, so the banner never clears.
+
+Ironically it is also proof the switch worked: stock Immich polls
+`version.immich.cloud`, so a Gallery release number in that banner can only come
+from Gallery's code. Treat the banner as decoration and use `update` as the real
+signal — it compares actual Gallery tags via `~/.gallery`. To silence it:
+*Administration → Settings → Server → Version check → off*.
+
+**`media.repository.js: not needed, upstream already passes { unlimited: true }`.**
+The community-scripts HEIC hotfix was adopted upstream in Immich v3.1.0, so there
+is nothing left to patch in either flavor. Stock Immich prints the same thing.
+The half upstream did not adopt is `limitInputPixels: false`, so sharp's default
+~268 megapixel cap still applies — again, exactly as on stock Immich.
+
 ## Known limitations
 
 - **`ct/immich.sh` run by hand against a Gallery install is still unsafe.**
