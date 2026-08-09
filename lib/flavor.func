@@ -15,6 +15,51 @@ GALLERY_REPO="open-noodle/gallery"
 IMMICH_REPO="immich-app/immich"
 
 # ==============================================================================
+# Failure reporting
+# ==============================================================================
+#
+# core.func's silent() — what $STD expands to — runs `trap - ERR` around every
+# command and then unconditionally re-registers `trap 'error_handler' ERR`. A
+# competing ERR trap therefore survives only until the first $STD call, which in
+# practice means recovery guidance never reached the user on a failed switch.
+#
+# So hook the handler function instead, since that is what silent() re-registers
+# by name. Set FLAVOR_RECOVERY_HINT before any risky step and it will be printed
+# on failure, whichever trap happens to be installed at the time.
+
+FLAVOR_RECOVERY_HINT="${FLAVOR_RECOVERY_HINT:-}"
+
+# Clear the hint once a risky step has completed successfully.
+flavor_clear_recovery_hint() {
+  FLAVOR_RECOVERY_HINT=""
+}
+
+flavor_install_error_hook() {
+  declare -F error_handler >/dev/null || return 0
+  declare -F flavor_upstream_error_handler >/dev/null && return 0
+
+  # Clone upstream's handler under a new name, then shadow the original.
+  eval "flavor_upstream_error_handler() $(declare -f error_handler | tail -n +2)"
+
+  error_handler() {
+    local rc=${1:-$?}
+    local cmd=${2:-${BASH_COMMAND:-unknown}}
+    local line=${BASH_LINENO[0]:-unknown}
+
+    if [[ "$rc" -ne 0 && -n "${FLAVOR_RECOVERY_HINT:-}" ]]; then
+      declare -F stop_spinner >/dev/null && { stop_spinner 2>/dev/null || true; }
+      printf '\n================= RECOVERY =================\n'
+      printf 'Failed at line %s: %s\n\n' "$line" "$cmd"
+      printf '%s\n' "$FLAVOR_RECOVERY_HINT"
+      printf '============================================\n\n'
+      FLAVOR_RECOVERY_HINT=""
+    fi
+
+    flavor_upstream_error_handler "$rc" "$cmd"
+  }
+}
+
+# ==============================================================================
 # Preflight
 # ==============================================================================
 

@@ -67,23 +67,9 @@ VERBOSE="${VERBOSE:-no}"
 set_std_mode
 catch_errors
 
-# Print recovery guidance before the framework's error handler runs.
-FLAVOR_RECOVERY_HINT=""
-flavor_on_error() {
-  local rc=$?
-  if [[ -n "$FLAVOR_RECOVERY_HINT" ]]; then
-    echo ""
-    echo "================= RECOVERY ================="
-    echo -e "$FLAVOR_RECOVERY_HINT"
-    echo "============================================"
-    echo ""
-  fi
-  if declare -F error_handler >/dev/null; then
-    error_handler
-  fi
-  exit "$rc"
-}
-trap 'flavor_on_error' ERR
+# Recovery guidance on failure. Hooks error_handler rather than the ERR trap,
+# which $STD reinstates behind our back — see flavor_install_error_hook.
+flavor_install_error_hook
 
 # ==============================================================================
 # Usage
@@ -332,7 +318,7 @@ Database dump, should you ever need it: ${backup_dir}/database.dump"
   # --- start ----------------------------------------------------------------
   # From here on the database is Gallery's: its migrations run at startup. Failing
   # loudly and suggesting a rollback would be wrong while that is in progress.
-  FLAVOR_RECOVERY_HINT=""
+  flavor_clear_recovery_hint
 
   flavor_start_services
   if flavor_wait_healthy 900; then
@@ -422,13 +408,19 @@ cmd_to_immich() {
 
   flavor_require_space 12
 
-  # --- locate the cleanup script before doing anything destructive ----------
+  # --- stage the cleanup script before doing anything destructive -----------
+  # It ships inside the Gallery source tree, and the Immich build below replaces
+  # /opt/immich/source wholesale. Copy it out now: remembering a path that is
+  # about to be deleted leaves the rollback stranded after the build, with the
+  # database still on Gallery's schema and app/ already on Immich.
   local revert_sql=""
   if [[ -z "$restore_dump" ]]; then
-    revert_sql="${SRC_DIR}/scripts/revert-to-immich.sql"
-    if [[ ! -f "$revert_sql" ]]; then
+    revert_sql="/tmp/immich-flavor-revert-to-immich.sql"
+    if [[ -f "${SRC_DIR}/scripts/revert-to-immich.sql" ]]; then
+      cp "${SRC_DIR}/scripts/revert-to-immich.sql" "$revert_sql"
+      msg_ok "Staged revert-to-immich.sql from the installed Gallery source"
+    else
       msg_info "Fetching revert-to-immich.sql for Gallery v${FLAVOR_VERSION}"
-      revert_sql="/tmp/revert-to-immich.sql"
       curl -fsSL "https://raw.githubusercontent.com/${GALLERY_REPO}/v${FLAVOR_VERSION}/scripts/revert-to-immich.sql" \
         -o "$revert_sql" ||
         curl -fsSL "https://raw.githubusercontent.com/${GALLERY_REPO}/main/scripts/revert-to-immich.sql" \
@@ -438,6 +430,10 @@ cmd_to_immich() {
         exit 1
       }
       msg_ok "Fetched revert-to-immich.sql"
+    fi
+    if [[ ! -s "$revert_sql" ]]; then
+      msg_error "revert-to-immich.sql is empty — refusing to continue."
+      exit 1
     fi
   fi
 
@@ -477,6 +473,8 @@ EOF
   local backup_dir
   flavor_backup "pre-immich"
   backup_dir="$FLAVOR_BACKUP_PATH"
+  # Keep the exact cleanup script that will run alongside the dump it runs against.
+  [[ -n "$revert_sql" ]] && cp "$revert_sql" "${backup_dir}/revert-to-immich.sql"
 
   FLAVOR_KEEP_APP_DIR=0
   if [[ "$snapshot" -eq 1 ]] && flavor_snapshot_app "$backup_dir"; then
@@ -500,6 +498,8 @@ Database dump: ${backup_dir}/database.dump"
   flavor_build_app "Immich" "$IMMICH_REPO" "$tag"
 
   # --- database -------------------------------------------------------------
+  # Read by the hooked error_handler in lib/flavor.func.
+  # shellcheck disable=SC2034
   FLAVOR_RECOVERY_HINT="Immich ${tag} was built but the database step failed. The
 cleanup script runs in one transaction, so the database is still Gallery's and the
 flavor marker still says gallery — app/ is the only thing out of step.
@@ -524,7 +524,7 @@ Fresh dump taken just now: ${backup_dir}/database.dump"
   flavor_restore_update_shim
   flavor_set_motd_name "Noodle Gallery" "immich"
 
-  FLAVOR_RECOVERY_HINT=""
+  flavor_clear_recovery_hint
 
   flavor_start_services
   if flavor_wait_healthy 600; then
@@ -564,6 +564,11 @@ EOF
 flavor_run_revert_sql() {
   local sql="$1" db staged
   db="$(flavor_db_name)"
+
+  if [[ ! -s "$sql" ]]; then
+    msg_error "Cleanup script missing or empty: ${sql}"
+    return 1
+  fi
 
   staged="/tmp/revert-to-immich.$$.sql"
   install -o postgres -g postgres -m 0600 "$sql" "$staged"

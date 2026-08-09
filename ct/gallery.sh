@@ -92,6 +92,7 @@ function update_script() {
   # shellcheck disable=SC1090
   source <(curl -fsSL "${RAW_BASE}/lib/compile-libs.func")
   flavor_paths
+  flavor_install_error_hook
 
   # ---------------------------------------------------------------------------
   # Host maintenance — identical to ct/immich.sh, all of it flavor-agnostic.
@@ -197,7 +198,18 @@ EOF
     # -------------------------------------------------------------------------
     # Rebuild
     # -------------------------------------------------------------------------
+    # Read by the hooked error_handler in lib/flavor.func.
+    # shellcheck disable=SC2034
+    FLAVOR_RECOVERY_HINT="The Gallery update failed. The database is untouched —
+Gallery's migrations only run when the server starts, and it has not started.
+
+app/ was rebuilt in place (updates do not snapshot it), so finish the job:
+  rm -f ~/.gallery && update
+
+Pre-update dump, if you need it: ${backup_dir}/database.dump"
+
     flavor_build_app "Gallery" "open-noodle/gallery" "${RELEASE}"
+    flavor_clear_recovery_hint
 
     # Keep the .env additions ct/immich.sh makes for older installs.
     if ! grep -q '^DB_HOSTNAME=' "$INSTALL_DIR"/.env; then
