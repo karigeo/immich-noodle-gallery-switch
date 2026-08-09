@@ -37,15 +37,22 @@ ImageMagick, libvips) in `/usr/local/lib`. Only `/opt/immich/app` and
 
 ## Setup
 
-1. Fork/push this repo to your own GitHub account.
-2. Replace `CHANGEME` in the `RAW_BASE` line at the top of `tools/immich-flavor.sh`
-   **and** `ct/gallery.sh` with your GitHub user:
+The scripts fetch each other over the network at runtime, so they need to know
+where they live. `RAW_BASE` at the top of `tools/immich-flavor.sh` and
+`ct/gallery.sh` points at this repository:
 
-   ```bash
-   RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/<you>/community-scripts-pve/main}"
-   ```
+```bash
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/karigeo/immich-noodle-gallery-switch/main}"
+```
 
-   You can also override it per run: `RAW_BASE=…/community-scripts-pve/dev`.
+Nothing to change if you use this repo as-is. If you fork it, edit that line in
+both files. To test a branch without editing anything, override it for the run:
+
+```bash
+RAW_BASE=https://raw.githubusercontent.com/karigeo/immich-noodle-gallery-switch/dev
+```
+
+The repository must be **public**, or the container cannot fetch from it.
 
 All commands below run **inside the LXC** as root (`pct enter <ctid>`).
 

@@ -12,8 +12,8 @@
 # Run inside the LXC. After a switch, /usr/bin/update points here, so `update`
 # is all you need.
 
-# --- point this at your fork -------------------------------------------------
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/CHANGEME/community-scripts-pve/main}"
+# --- where this repo lives; override with RAW_BASE=... to test a branch ------
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/karigeo/immich-noodle-gallery-switch/main}"
 # -----------------------------------------------------------------------------
 
 source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/misc/build.func)

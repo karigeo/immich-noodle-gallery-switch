@@ -14,8 +14,8 @@
 #   bash -c "$(curl -fsSL $RAW_BASE/tools/immich-flavor.sh)" -- to-gallery
 #   bash -c "$(curl -fsSL $RAW_BASE/tools/immich-flavor.sh)" -- to-immich
 
-# --- point this at your fork -------------------------------------------------
-RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/CHANGEME/community-scripts-pve/main}"
+# --- where this repo lives; override with RAW_BASE=... to test a branch ------
+RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/karigeo/immich-noodle-gallery-switch/main}"
 # -----------------------------------------------------------------------------
 
 CS_BASE="https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main"
