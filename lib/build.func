@@ -122,31 +122,49 @@ flavor_chown_install() {
 # ------------------------------------------------------------------------------
 # flavor_patch_media_repository()
 #
-# MickLesk's HEIC thumbnail hotfix, carried over from the upstream scripts.
-# Idempotent and non-fatal: if the fork rewrote the call site the patch is skipped.
+# MickLesk's HEIC thumbnail hotfix, carried over from the upstream scripts: it
+# passed { unlimited: true, limitInputPixels: false } to the sharp() call that
+# reads image metadata.
+#
+# As of Immich v3.1.0 — and therefore Gallery v5.3.1, which is rebased on it —
+# the source already reads `sharp(input, { unlimited: true }).metadata()`, so the
+# patch no longer matches anything in either flavor. It is kept because it costs
+# nothing and would catch an upstream regression, but the outcome is reported
+# precisely instead of the bare "pattern not found", which read like a failure.
+#
+# The one thing upstream did not adopt is limitInputPixels: false, so sharp's
+# default cap of ~268 megapixels still applies. That is true of a stock Immich
+# install too, and only matters for extremely large panoramas or scans.
 # ------------------------------------------------------------------------------
 flavor_patch_media_repository() {
-  local repo_js="${APP_DIR}/dist/repositories/media.repository.js"
+  local repo_js="${APP_DIR}/dist/repositories/media.repository.js" outcome
   [[ -f "$repo_js" ]] || return 0
 
-  msg_info "Patching media.repository.js"
-  MEDIA_REPO_JS="$repo_js" python3 - <<'PY'
+  msg_info "Checking media.repository.js sharp options"
+  # Captured rather than printed straight out, so the result cannot land in the
+  # middle of the spinner line.
+  outcome="$(MEDIA_REPO_JS="$repo_js" python3 - <<'PY'
 import os
+import re
 from pathlib import Path
 
 p = Path(os.environ['MEDIA_REPO_JS'])
 s = p.read_text()
 old = "(0, sharp_1.default)(input).metadata()"
 new = "(0, sharp_1.default)(input, { unlimited: true, limitInputPixels: false }).metadata()"
+
 if new in s:
-    print('hotfix already there')
+    print('already patched by a previous run')
 elif old in s:
     p.write_text(s.replace(old, new, 1))
     print('hotfix applied')
+elif re.search(r'sharp_1\.default\)\(input,\s*\{[^}]*unlimited:\s*true', s):
+    print('not needed, upstream already passes { unlimited: true }')
 else:
-    print('pattern not found, skipped')
+    print('call site not recognised, left alone')
 PY
-  msg_ok "Patched media.repository.js"
+  )"
+  msg_ok "media.repository.js: ${outcome}"
 }
 
 # ------------------------------------------------------------------------------
